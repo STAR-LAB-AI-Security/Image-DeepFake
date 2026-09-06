@@ -1,0 +1,45 @@
+{
+  "benchmark": "图像痕迹隐匿与鲁棒检测",
+  "stage": "defense",
+  "train_size": 192,
+  "test_size": 96,
+  "n_test_fake": 48,
+  "n_test_real": 48,
+  "seed": 42,
+  "defense_baseline": "frequency_stat",
+  "clean_auc": 1.0,
+  "clean_acc": 1.0,
+  "clean_eer": 0.0,
+  "robust_auc": 0.2857,
+  "robust_acc": 0.375,
+  "robust_eer": 1.0,
+  "per_attack_auc": {
+    "identity": 1.0,
+    "jpeg": 0.0,
+    "resize_recover": 0.0,
+    "blur_sharpen": 0.0,
+    "color_laundering": 1.0,
+    "frequency_laundering": 0.0,
+    "composite_hidden": 0.0
+  },
+  "per_attack_asr": {
+    "identity": 0.0,
+    "jpeg": 1.0,
+    "resize_recover": 1.0,
+    "blur_sharpen": 1.0,
+    "color_laundering": 0.0,
+    "frequency_laundering": 1.0,
+    "composite_hidden": 1.0
+  },
+  "n_legal_per_attack": {
+    "identity": 48,
+    "jpeg": 48,
+    "resize_recover": 48,
+    "blur_sharpen": 48,
+    "color_laundering": 48,
+    "frequency_laundering": 48,
+    "composite_hidden": 48
+  },
+  "hidden_attack_auc": 0.0,
+  "defense_score": 0.6429
+}

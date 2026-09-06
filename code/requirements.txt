@@ -1,0 +1,6 @@
+# 图像痕迹隐匿与鲁棒检测基准（Baseline）运行依赖
+# 仅需 CPU 即可跑通攻击/防御终端脚本（无 GPU、无网络也可运行）
+numpy>=1.24
+scikit-learn>=1.3
+scipy>=1.10
+Pillow>=9.0
