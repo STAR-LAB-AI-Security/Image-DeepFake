@@ -1,0 +1,18 @@
+{
+  "workDirId": "mu4guuts310s9h",
+  "branch": "def-1120231566",
+  "uploaderBranch": true,
+  "githubAccount": "yhy0828",
+  "displayName": "杨宏宇",
+  "scenario": "deepfake_image",
+  "role": "solo_defense",
+  "userId": "3ca89b02-7d7a-42eb-908e-cb4c4790a595",
+  "version": 1,
+  "originalZipName": "defense.py",
+  "archivedZip": false,
+  "uploadedAt": "2026-09-16T19:01:01.246Z",
+  "files": [
+    "defense.py"
+  ],
+  "skippedLargeFiles": []
+}
