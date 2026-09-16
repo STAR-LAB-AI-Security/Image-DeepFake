@@ -1,0 +1,11 @@
+{
+  "workDirId": "mu4guuts310s9h",
+  "scenario": "deepfake_image",
+  "role": "solo_defense",
+  "version": 1,
+  "uploadedAt": "2026-09-16T19:01:04.630Z",
+  "files": [
+    "defense.py",
+    "meta.json"
+  ]
+}
