@@ -1,0 +1,11 @@
+{
+  "workDirId": "mu4c0jmjq7cplp",
+  "scenario": "deepfake_image",
+  "role": "solo_attack",
+  "version": 4,
+  "uploadedAt": "2026-09-16T16:45:34.735Z",
+  "files": [
+    "attack.py",
+    "meta.json"
+  ]
+}
