@@ -1,0 +1,708 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""防御代码 —— 图像痕迹隐匿与鲁棒检测基准（Baseline：频域统计检测器）。
+
+赛题中，防御方需提交 DeepFake 检测算法：仅根据最终输入图像（可能已被后处理
+攻击隐匿）输出其为 DeepFake 的概率 fake_probability ∈ [0, 1]，同时应对未处理
+DeepFake、公开后处理攻击与隐藏组合攻击，并保持真实图像低误报。
+
+真实世界中的 DeepFake 检测器（见 DeepfakeBench）多为 CNN（Xception、MesoNet、
+EfficientNet 等）或频域特征检测器（F3Net、SPSL、SRM 等），输入统一为
+256×256 人脸裁剪、归一化到 [-1,1] 后送入网络。本基准在 CPU 上交付一个
+**轻量化实现**：对赛题材料 deepguard_backend 中 frequency_stat 检测器（SRM
+噪声残差 + 分块 DCT + FFT 频带统计 + 颜色统计特征 + 逻辑回归）的忠实复刻，
+作为交付 Baseline **FrequencyStatDefense**（对应防御固定池 D0-3 频域特征家族）。
+
+防御固定池 D0 另含一个空域/像素统计检测器 PixelStatDefense（通道统计 + 梯度
+统计 + 逻辑回归），用于衡量攻击的跨检测器迁移能力。
+
+接口（两类，互不耦合）：
+    ① 槽位（学生提交，契约见 defense-blank.py）：class Defense
+        需支持 __init__(C=1.0, max_iter=500, seed=42, **kwargs)、
+        fit(images, labels) -> self、predict(image) -> float；
+        backend 自带 FeatureDetector 基类与频域/像素特征工具，可继承或完全自定义。
+    ② 模块级 defend(request)（赛题 §7.4 提交接口兼容层）：
+        默认使用后端自带官方基线 FrequencyStatDefense，与槽位学生代码无关。
+
+用法：
+    python defense.py                  # 在训练集上拟合官方基线，输出清洁集自检结果
+    python defense.py --detector pixel  # 指定像素统计检测器
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+
+import numpy as np
+
+from dataset import load_benchmark
+
+# --------------------------------------------------------------------------- #
+# 频域/噪声残差特征（忠实于材料 deepguard_backend/defenses/frequency_stat.py）
+# --------------------------------------------------------------------------- #
+# SRM 高通噪声残差滤波器（标准 17 个中的 3 个）
+_SRM_FILTERS = [
+    np.array([[-1, 2, -2, 2, -1], [2, -6, 8, -6, 2], [-2, 8, -12, 8, -2],
+              [2, -6, 8, -6, 2], [-1, 2, -2, 2, -1]], dtype=np.float32) / 12.0,
+    np.array([[0, 0, 0, 0, 0], [0, -1, 2, -1, 0], [0, 2, -4, 2, 0],
+              [0, -1, 2, -1, 0], [0, 0, 0, 0, 0]], dtype=np.float32) / 4.0,
+    np.array([[-1, 2, -1], [2, -4, 2], [-1, 2, -1]], dtype=np.float32) / 4.0,
+]
+
+
+def _dct2(block: np.ndarray) -> np.ndarray:
+    """2D DCT-II（基于 scipy.fft.dct，逐轴正交归一）。"""
+    from scipy.fft import dct
+    return dct(dct(block, axis=0, norm="ortho"), axis=1, norm="ortho")
+
+
+def extract_frequency_features(image: np.ndarray) -> np.ndarray:
+    """紧凑频域 + 噪声残差特征向量（31 维）。
+
+    组成：
+    1. 3 个 SRM 高通残差滤波器的均值/标准差/绝对均值/99%-1% 分位差（12 维）；
+    2. 8×8 分块 DCT 能量谱的 5 个代表性系数（低频 0,1,9 与高频 56,63）的
+       log1p 能量与高/低频能量比（6 维）；
+    3. 全局 FFT 幅度谱低/高频带（半径 <15% / >40%）的均值与标准差（4 维）；
+    4. 每通道颜色统计：均值/标准差/极差（9 维）。
+    """
+    from scipy import ndimage as ndi
+
+    img = np.asarray(image, dtype=np.float32)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    gray = np.mean(img, axis=2)
+
+    feats: list = []
+    # --- SRM 噪声残差统计 ---
+    for kern in _SRM_FILTERS:
+        res = ndi.convolve(gray, kern, mode="reflect")
+        feats += [float(res.mean()), float(res.std()),
+                  float(np.mean(np.abs(res))),
+                  float(np.percentile(res, 99) - np.percentile(res, 1))]
+    # --- 8×8 分块 DCT 能量 ---
+    h, w = gray.shape
+    bh, bw = 8, 8
+    acc = np.zeros((bh, bw), dtype=np.float32)
+    count = 0
+    for i in range(0, h - bh + 1, bh):
+        for j in range(0, w - bw + 1, bw):
+            acc += np.abs(_dct2(gray[i:i + bh, j:j + bw]))
+            count += 1
+    if count > 0:
+        acc /= count
+    flat = acc.flatten()
+    feats += [float(np.log1p(flat[k])) for k in (0, 1, 9, 56, 63)]
+    low = float(np.sum(acc[:2, :2]))
+    high = float(np.sum(acc[4:, 4:]))
+    feats += [float(np.log1p(high / (low + 1e-6)))]
+    # --- 全局 FFT 幅度统计 ---
+    f = np.fft.fftshift(np.fft.fft2(gray))
+    mag = np.log1p(np.abs(f))
+    cy, cx = h // 2, w // 2
+    yy, xx = np.mgrid[:h, :w]
+    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    low_mask = r < min(h, w) * 0.15
+    high_mask = r > min(h, w) * 0.4
+    feats += [float(mag[low_mask].mean()), float(mag[high_mask].mean()),
+              float(mag[low_mask].std()), float(mag[high_mask].std())]
+    # --- 每通道颜色统计 ---
+    for c in range(3):
+        ch = img[..., c]
+        feats += [float(ch.mean()), float(ch.std()), float(ch.max() - ch.min())]
+    return np.array(feats, dtype=np.float32)
+
+
+def extract_pixel_features(image: np.ndarray) -> np.ndarray:
+    """空域/像素统计特征向量（15 维）。
+
+    组成：每通道均值/标准差/极差/95%-5% 分位差（12 维）+ 灰度图水平/垂直
+    梯度绝对均值与灰度标准差（3 维）。捕捉颜色偏移与纹理/边缘统计差异。
+    """
+    img = np.asarray(image, dtype=np.float32)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    gray = np.mean(img, axis=2)
+    feats: list = []
+    for c in range(3):
+        ch = img[..., c]
+        feats += [float(ch.mean()), float(ch.std()),
+                  float(ch.max() - ch.min()),
+                  float(np.percentile(ch, 95) - np.percentile(ch, 5))]
+    gx = np.diff(gray, axis=0)
+    gy = np.diff(gray, axis=1)
+    feats += [float(np.mean(np.abs(gx))), float(np.mean(np.abs(gy))),
+              float(np.std(gray))]
+    return np.array(feats, dtype=np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# 检测器基类：特征 + 标准化 + 逻辑回归
+# --------------------------------------------------------------------------- #
+class FeatureDetector:
+    """基于"特征 + StandardScaler + LogisticRegression"的轻量检测器基类。
+
+    与 DeepfakeBench 的检测协议一致：图像先归一化（本实现以特征替代端到端
+    网络），输出为 fake_probability ∈ [0,1]（1 = DeepFake）。
+    """
+
+    feature_dim = 0
+
+    def __init__(self, C: float = 1.0, max_iter: int = 500, seed: int = 42) -> None:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+
+        self.C = C
+        self.max_iter = max_iter
+        self.seed = seed
+        self._scaler = StandardScaler()
+        self._clf = LogisticRegression(C=C, max_iter=max_iter, random_state=seed)
+        self._fitted = False
+
+    # -- 子类需实现 --
+    def _extract(self, image: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    # -- 训练 --
+    def fit(self, images: np.ndarray, labels: np.ndarray) -> "FeatureDetector":
+        """在 (images, labels) 上拟合检测器。images: [N, H, W, 3] uint8。"""
+        labels = np.asarray(labels, dtype=np.int64)
+        X = np.stack([self._extract(im) for im in images])
+        if len(np.unique(labels)) < 2:
+            self._fitted = False
+            return self
+        Xs = self._scaler.fit_transform(X)
+        self._clf.fit(Xs, labels)
+        self._fitted = True
+        return self
+
+    # -- 推理 --
+    def predict(self, image: np.ndarray) -> float:
+        """返回 P(fake | image) ∈ [0, 1]。"""
+        if not self._fitted:
+            return 0.5
+        feat = self._extract(image).reshape(1, -1)
+        feat = self._scaler.transform(feat)
+        df = float(self._clf.decision_function(feat)[0])
+        return float(1.0 / (1.0 + np.exp(-df)))
+
+    def predict_batch(self, images) -> list:
+        return [self.predict(im) for im in images]
+
+
+class FrequencyStatDefense(FeatureDetector):
+    """频域统计检测器（官方基线 D0-3，后端自带；防御固定池 frequency_stat 成员）。
+
+    特征：31 维 SRM 噪声残差 + 分块 DCT 能量 + FFT 频带 + 颜色统计（逻辑回归）。
+    """
+
+    name = "frequency_stat"
+    feature_dim = 31
+
+    def _extract(self, image: np.ndarray) -> np.ndarray:
+        return extract_frequency_features(image)
+
+
+class PixelStatDefense(FeatureDetector):
+    """像素统计检测器（官方基线，后端自带；防御固定池 pixel_stat 成员）。
+
+    特征：15 维通道统计 + 梯度/灰度统计（逻辑回归），用于衡量攻击跨检测器迁移。
+    """
+
+    name = "pixel_stat"
+    feature_dim = 15
+
+    def _extract(self, image: np.ndarray) -> np.ndarray:
+        return extract_pixel_features(image)
+
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""防御代码 —— 高级鲁棒频域-空域融合检测器（Advanced Defense）。
+
+设计思路：
+    针对赛题"攻击后鲁棒检测"需求，在 Baseline FrequencyStatDefense 基础上做四大改进：
+
+    1. 攻击增强训练：
+       训练时对 fake 图随机施加后处理（JPEG/缩放/频域洗白/模糊/噪声），
+       让模型见过"攻击后图像"，提升对未知攻击的鲁棒性。
+
+    2. 多特征融合（66 维）：
+       - 频域特征（31 维）：SRM 残差 + 分块 DCT + FFT 频带 + 颜色
+       - 空域特征（15 维）：通道统计 + 梯度统计
+       - 颜色特征（12 维）：HSV 直方图 + 通道相关性
+       - 噪声残差（8 维）：多尺度高频残差统计
+
+    3. 非线性分类器：
+       用 GradientBoostingClassifier 替代 LogisticRegression，
+       捕捉攻击后特征的非线性偏移。
+
+    4. 模型集成：
+       频域模型 + 空域模型 + 融合模型，三者 soft-voting 平均。
+
+接口（平台契约）：
+    Defense(C=1.0, max_iter=500, seed=42).fit(images, labels).predict(image) -> float
+"""
+
+import numpy as np
+
+# --------------------------------------------------------------------------- #
+# SRM 高通噪声残差滤波器（标准 17 个中的 3 个）
+# --------------------------------------------------------------------------- #
+_SRM_FILTERS = [
+    np.array([[-1, 2, -2, 2, -1], [2, -6, 8, -6, 2], [-2, 8, -12, 8, -2],
+              [2, -6, 8, -6, 2], [-1, 2, -2, 2, -1]], dtype=np.float32) / 12.0,
+    np.array([[0, 0, 0, 0, 0], [0, -1, 2, -1, 0], [0, 2, -4, 2, 0],
+              [0, -1, 2, -1, 0], [0, 0, 0, 0, 0]], dtype=np.float32) / 4.0,
+    np.array([[-1, 2, -1], [2, -4, 2], [-1, 2, -1]], dtype=np.float32) / 4.0,
+]
+
+
+def _dct2(block: np.ndarray) -> np.ndarray:
+    """2D DCT-II（正交归一）。"""
+    from scipy.fft import dct
+    return dct(dct(block, axis=0, norm="ortho"), axis=1, norm="ortho")
+
+
+# --------------------------------------------------------------------------- #
+# 特征提取（4 组，共 66 维）
+# --------------------------------------------------------------------------- #
+def _extract_frequency_features(image: np.ndarray) -> np.ndarray:
+    """频域特征（31 维）：SRM 残差 12 + 分块 DCT 6 + FFT 频带 4 + 颜色 9。"""
+    from scipy import ndimage as ndi
+
+    img = np.asarray(image, dtype=np.float32)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    gray = np.mean(img, axis=2)
+
+    feats = []
+    # 1) SRM 噪声残差
+    for kern in _SRM_FILTERS:
+        res = ndi.convolve(gray, kern, mode="reflect")
+        feats += [float(res.mean()), float(res.std()),
+                  float(np.mean(np.abs(res))),
+                  float(np.percentile(res, 99) - np.percentile(res, 1))]
+    # 2) 8×8 分块 DCT
+    h, w = gray.shape
+    acc = np.zeros((8, 8), dtype=np.float32)
+    count = 0
+    for i in range(0, h - 8 + 1, 8):
+        for j in range(0, w - 8 + 1, 8):
+            acc += np.abs(_dct2(gray[i:i+8, j:j+8]))
+            count += 1
+    if count > 0:
+        acc /= count
+    flat = acc.flatten()
+    feats += [float(np.log1p(flat[k])) for k in (0, 1, 9, 56, 63)]
+    low = float(np.sum(acc[:2, :2]))
+    high = float(np.sum(acc[4:, 4:]))
+    feats += [float(np.log1p(high / (low + 1e-6)))]
+    # 3) 全局 FFT
+    f = np.fft.fftshift(np.fft.fft2(gray))
+    mag = np.log1p(np.abs(f))
+    cy, cx = h // 2, w // 2
+    yy, xx = np.mgrid[:h, :w]
+    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    low_mask = r < min(h, w) * 0.15
+    high_mask = r > min(h, w) * 0.4
+    feats += [float(mag[low_mask].mean()), float(mag[high_mask].mean()),
+              float(mag[low_mask].std()), float(mag[high_mask].std())]
+    # 4) 颜色统计
+    for c in range(3):
+        ch = img[..., c]
+        feats += [float(ch.mean()), float(ch.std()), float(ch.max() - ch.min())]
+    return np.array(feats, dtype=np.float32)
+
+
+def _extract_spatial_features(image: np.ndarray) -> np.ndarray:
+    """空域特征（15 维）：通道统计 12 + 梯度统计 3。"""
+    img = np.asarray(image, dtype=np.float32)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    gray = np.mean(img, axis=2)
+    feats = []
+    for c in range(3):
+        ch = img[..., c]
+        feats += [float(ch.mean()), float(ch.std()),
+                  float(ch.max() - ch.min()),
+                  float(np.percentile(ch, 95) - np.percentile(ch, 5))]
+    gx = np.diff(gray, axis=0)
+    gy = np.diff(gray, axis=1)
+    feats += [float(np.mean(np.abs(gx))), float(np.mean(np.abs(gy))),
+              float(np.std(gray))]
+    return np.array(feats, dtype=np.float32)
+
+
+def _extract_color_features(image: np.ndarray) -> np.ndarray:
+    """颜色特征（12 维）：HSV 直方图 + 通道相关性。"""
+    img = np.asarray(image, dtype=np.float32)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    # 简化 HSV：max, min, diff
+    r, g, b = img[..., 0], img[..., 1], img[..., 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    diff = mx - mn
+    feats = [
+        float(mx.mean()), float(mx.std()),
+        float(mn.mean()), float(mn.std()),
+        float(diff.mean()), float(diff.std()),
+    ]
+    # 通道相关性
+    rg = np.corrcoef(r.flatten(), g.flatten())[0, 1]
+    rb = np.corrcoef(r.flatten(), b.flatten())[0, 1]
+    gb = np.corrcoef(g.flatten(), b.flatten())[0, 1]
+    feats += [float(rg), float(rb), float(gb)]
+    # 通道差统计
+    feats += [float(np.mean(np.abs(r - g))),
+              float(np.mean(np.abs(r - b))),
+              float(np.mean(np.abs(g - b)))]
+    return np.array(feats, dtype=np.float32)
+
+
+def _extract_noise_features(image: np.ndarray) -> np.ndarray:
+    """噪声残差特征（8 维）：多尺度高频残差统计。"""
+    from scipy import ndimage as ndi
+
+    img = np.asarray(image, dtype=np.float32)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    gray = np.mean(img, axis=2)
+    feats = []
+    # 多尺度拉普拉斯
+    for sigma in (0.5, 1.0, 1.5, 2.0):
+        blur = ndi.gaussian_filter(gray, sigma=sigma)
+        residual = gray - blur
+        feats += [float(residual.std()), float(np.mean(np.abs(residual)))]
+    return np.array(feats, dtype=np.float32)
+
+
+def extract_all_features(image: np.ndarray) -> np.ndarray:
+    """全部特征（66 维）= 频域 31 + 空域 15 + 颜色 12 + 噪声 8。"""
+    return np.concatenate([
+        _extract_frequency_features(image),
+        _extract_spatial_features(image),
+        _extract_color_features(image),
+        _extract_noise_features(image),
+    ])
+
+
+# --------------------------------------------------------------------------- #
+# 攻击增强（训练时模拟攻击后图像）
+# --------------------------------------------------------------------------- #
+def _attack_augment(image: np.ndarray, rng: np.random.RandomState) -> list:
+    """对单张图像生成多个攻击增强版本。"""
+    from PIL import Image
+    import io
+
+    augs = [image]  # 原图
+
+    # 1) 频域洗白（多种强度）
+    for cutoff, strength in [(0.30, 0.5), (0.35, 0.4), (0.40, 0.3)]:
+        augs.append(_freq_launder(image, cutoff, strength))
+
+    # 2) 缩放-恢复
+    for ds in (192, 224):
+        augs.append(_resize_recover(image, ds))
+
+    # 3) JPEG 重编码
+    for q in (65, 75, 85):
+        augs.append(_jpeg_reencode(image, q))
+
+    # 4) 轻微模糊
+    augs.append(_gaussian_blur(image, 0.8))
+
+    # 5) 随机组合（2 步）
+    if rng.rand() < 0.5:
+        img = _freq_launder(image, 0.35, 0.4)
+        img = _jpeg_reencode(img, 80)
+        augs.append(img)
+
+    return augs
+
+
+def _freq_launder(image: np.ndarray, cutoff: float, strength: float) -> np.ndarray:
+    img = np.asarray(image, dtype=np.float32)
+    h, w, c = img.shape
+    cy, cx = h // 2, w // 2
+    y = np.arange(h) - cy
+    x = np.arange(w) - cx
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    r = np.sqrt((yy / max(cy, 1)) ** 2 + (xx / max(cx, 1)) ** 2)
+    mask = 1.0 / (1.0 + np.exp((r - cutoff) * 12.0))
+    out = np.empty_like(img)
+    for ch in range(c):
+        f = np.fft.fftshift(np.fft.fft2(img[..., ch]))
+        low = np.real(np.fft.ifft2(np.fft.ifftshift(f * mask)))
+        out[..., ch] = img[..., ch] * (1.0 - strength) + low * strength
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _resize_recover(image: np.ndarray, down_size: int) -> np.ndarray:
+    from PIL import Image
+    img = Image.fromarray(np.asarray(image, dtype=np.uint8))
+    w, h = img.size
+    small = img.resize((down_size, down_size), Image.BICUBIC)
+    return np.asarray(small.resize((w, h), Image.BICUBIC).convert("RGB"), dtype=np.uint8)
+
+
+def _jpeg_reencode(image: np.ndarray, quality: int) -> np.ndarray:
+    from PIL import Image
+    import io
+    img = Image.fromarray(np.asarray(image, dtype=np.uint8))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    return np.asarray(Image.open(buf).convert("RGB"), dtype=np.uint8)
+
+
+def _gaussian_blur(image: np.ndarray, radius: float) -> np.ndarray:
+    from PIL import Image, ImageFilter
+    img = Image.fromarray(np.asarray(image, dtype=np.uint8))
+    return np.asarray(img.filter(ImageFilter.GaussianBlur(radius=radius)).convert("RGB"),
+                      dtype=np.uint8)
+
+
+# --------------------------------------------------------------------------- #
+# 主检测器
+# --------------------------------------------------------------------------- #
+class Defense:
+    """高级鲁棒频域-空域融合检测器。
+
+    组成：
+        1. 频域模型：31 维频域特征 + GBDT
+        2. 空域模型：15 维空域特征 + GBDT
+        3. 融合模型：66 维全特征 + GBDT
+        三者 soft-voting 平均。
+
+    训练时对 fake 图做攻击增强，提升鲁棒性。
+    """
+
+    name = "defense"
+
+    def __init__(self, C: float = 1.0, max_iter: int = 500,
+                 seed: int = 42, **kwargs):
+        from sklearn.ensemble import GradientBoostingClassifier
+        from sklearn.preprocessing import StandardScaler
+
+        self.C = C
+        self.max_iter = max_iter
+        self.seed = int(seed)
+        self.augment = bool(kwargs.get("augment", True))
+
+        self._scaler_freq = StandardScaler()
+        self._scaler_spatial = StandardScaler()
+        self._scaler_all = StandardScaler()
+
+        self._clf_freq = GradientBoostingClassifier(
+            n_estimators=100, max_depth=3, learning_rate=0.1,
+            random_state=self.seed)
+        self._clf_spatial = GradientBoostingClassifier(
+            n_estimators=100, max_depth=3, learning_rate=0.1,
+            random_state=self.seed)
+        self._clf_all = GradientBoostingClassifier(
+            n_estimators=150, max_depth=3, learning_rate=0.1,
+            random_state=self.seed)
+
+        self._fitted = False
+
+    def fit(self, images, labels):
+        labels = np.asarray(labels, dtype=np.int64)
+
+        # 攻击增强
+        if self.augment:
+            rng = np.random.RandomState(self.seed)
+            aug_imgs, aug_labels = [], []
+            for im, lb in zip(images, labels):
+                augs = _attack_augment(im, rng)
+                aug_imgs.extend(augs)
+                aug_labels.extend([lb] * len(augs))
+            images = np.stack(aug_imgs)
+            labels = np.asarray(aug_labels, dtype=np.int64)
+            print(f"[defense] 攻击增强后训练集: {len(labels)} 张")
+
+        if len(np.unique(labels)) < 2:
+            self._fitted = False
+            return self
+
+        # 提取特征
+        X_freq = np.stack([_extract_frequency_features(im) for im in images])
+        X_spatial = np.stack([_extract_spatial_features(im) for im in images])
+        X_all = np.concatenate([X_freq, X_spatial,
+                                np.stack([_extract_color_features(im) for im in images]),
+                                np.stack([_extract_noise_features(im) for im in images])],
+                               axis=1)
+
+        # 训练三个模型
+        Xf = self._scaler_freq.fit_transform(X_freq)
+        self._clf_freq.fit(Xf, labels)
+
+        Xs = self._scaler_spatial.fit_transform(X_spatial)
+        self._clf_spatial.fit(Xs, labels)
+
+        Xa = self._scaler_all.fit_transform(X_all)
+        self._clf_all.fit(Xa, labels)
+
+        self._fitted = True
+        return self
+
+    def predict(self, image) -> float:
+        if not self._fitted:
+            return 0.5
+
+        # 频域模型
+        xf = _extract_frequency_features(image).reshape(1, -1)
+        xf = self._scaler_freq.transform(xf)
+        pf = float(self._clf_freq.predict_proba(xf)[0, 1])
+
+        # 空域模型
+        xs = _extract_spatial_features(image).reshape(1, -1)
+        xs = self._scaler_spatial.transform(xs)
+        ps = float(self._clf_spatial.predict_proba(xs)[0, 1])
+
+        # 融合模型
+        xa = np.concatenate([
+            _extract_frequency_features(image),
+            _extract_spatial_features(image),
+            _extract_color_features(image),
+            _extract_noise_features(image),
+        ]).reshape(1, -1)
+        xa = self._scaler_all.transform(xa)
+        pa = float(self._clf_all.predict_proba(xa)[0, 1])
+
+        # soft-voting 平均（可调权重）
+        return float(0.3 * pf + 0.2 * ps + 0.5 * pa)
+
+
+# --------------------------------------------------------------------------- #
+# 平台接口
+# --------------------------------------------------------------------------- #
+_DETECTOR = Defense()
+
+
+def set_detector(detector) -> None:
+    global _DETECTOR
+    _DETECTOR = detector
+
+
+def get_detector():
+    return _DETECTOR
+
+
+def defend(request: dict) -> dict:
+    """DeepFake 检测（平台契约）。"""
+    image = request["image"]
+    p = float(_DETECTOR.predict(image))
+    p = min(1.0, max(0.0, p))
+    return {"fake_probability": p}
+
+
+def build_defense(name: str = "defense", **params):
+    table = {"defense": Defense, "frequency_stat": Defense}
+    if name not in table:
+        raise ValueError(f"未知检测器: {name}")
+    return table[name](**params)
+
+
+FIXED_DEFENSE_POOL = [
+    ("frequency_stat", {"C": 1.0, "max_iter": 500, "seed": 42}),
+]
+
+
+if __name__ == "__main__":
+    from dataset import load_benchmark
+    from sklearn import metrics as skm
+
+    train, test = load_benchmark()
+    det = Defense()
+    det.fit(train["images"], train["labels"])
+    set_detector(det)
+
+    scores = np.array([det.predict(im) for im in test["images"]])
+    labels = test["labels"]
+    auc = skm.roc_auc_score(labels, scores)
+    acc = float(np.mean((scores >= 0.5).astype(int) == labels))
+    print(f"[defense] CleanAUC = {auc:.4f}  CleanACC = {acc:.4f}")
+
+
+# --------------------------------------------------------------------------- #
+# 交付 Baseline 接口（赛题 §7.4：defense.py 的 defend(request) -> {"fake_probability"}）
+# --------------------------------------------------------------------------- #
+# 模块级 defend() 兼容层使用官方基线（后端自带），与槽位学生代码无关；
+# 惰性创建，避免 import 期开销（不会提前执行学生 __init__）。
+_DETECTOR = None
+
+
+def get_detector():
+    """返回当前检测器；未显式注入时惰性创建官方基线 FrequencyStatDefense。"""
+    global _DETECTOR
+    if _DETECTOR is None:
+        _DETECTOR = FrequencyStatDefense()
+    return _DETECTOR
+
+
+def set_detector(detector) -> None:
+    """注入模块级 defend() 使用的检测器实例（官方基线自检时注入已拟合实例）。"""
+    global _DETECTOR
+    _DETECTOR = detector
+
+
+def defend(request: dict) -> dict:
+    """DeepFake 检测（交付 Baseline）。
+
+    参数
+    ----
+    request : {"sample_id": str, "image": RGB uint8 H×W×3}
+
+    返回
+    ----
+    {"fake_probability": float ∈ [0,1]，0=高置信真实，1=高置信 DeepFake}
+    """
+    image = request["image"]
+    p = float(get_detector().predict(image))
+    p = min(1.0, max(0.0, p))  # 钳制到 [0,1]
+    return {"fake_probability": p}
+
+
+def build_defense(name: str, **params):
+    """按名称构造官方基线检测器（供 test.py 使用，与槽位学生代码无关）。"""
+    table = {"frequency_stat": FrequencyStatDefense, "pixel_stat": PixelStatDefense}
+    if name not in table:
+        raise ValueError(f"未知检测器: {name}")
+    return table[name](**params)
+
+
+# 防御固定池 D0（交付 Baseline 为 frequency_stat；pixel_stat 用于衡量攻击迁移）
+FIXED_DEFENSE_POOL = [
+    ("frequency_stat", {"C": 1.0, "max_iter": 500, "seed": 42}),
+    ("pixel_stat", {"C": 1.0, "max_iter": 500, "seed": 42}),
+]
+
+
+if __name__ == "__main__":
+    from sklearn import metrics as skm
+
+    parser = argparse.ArgumentParser(description="频域统计检测器自检（交付 Baseline）")
+    parser.add_argument("--detector", default="frequency_stat",
+                        choices=["frequency_stat", "pixel_stat"])
+    args = parser.parse_args()
+
+    train, test = load_benchmark()
+    det = build_defense(args.detector)
+    det.fit(train["images"], train["labels"])
+    set_detector(det)  # 使 defend() 使用已拟合的检测器
+
+    scores = np.array([det.predict(im) for im in test["images"]])
+    labels = test["labels"]
+    auc = skm.roc_auc_score(labels, scores)
+    acc = float(np.mean((scores >= 0.5).astype(int) == labels))
+    print(f"[defense] {det.name} 检测器自检：训练 {len(train['labels'])} 张, "
+          f"测试 {len(labels)} 张")
+    print(f"[defense] CleanAUC = {auc:.4f}  CleanACC(τ=0.5) = {acc:.4f}")
+    print("[defense] 示例推理：")
+    for i in (0, 1):
+        out = defend({"sample_id": test["sample_ids"][i], "image": test["images"][i]})
+        print(f"          {test['sample_ids'][i]}  label={labels[i]}  "
+              f"fake_probability={out['fake_probability']:.4f}")
