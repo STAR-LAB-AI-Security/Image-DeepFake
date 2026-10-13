@@ -1,0 +1,19 @@
+{
+  "workDirId": "mv6mir2fwy8m3u",
+  "branch": "def-zheng",
+  "uploaderBranch": true,
+  "githubAccount": "zheng2004521",
+  "displayName": "郑屹",
+  "scenario": "deepfake_image",
+  "role": "solo_defense",
+  "userId": "2e8f7574-c0bb-4396-b99e-21a22a6be5cc",
+  "version": 6,
+  "originalZipName": "defense.zip",
+  "archivedZip": true,
+  "uploadedAt": "2026-10-13T11:54:48.187Z",
+  "files": [
+    "defense-blank.py",
+    "defense.zip"
+  ],
+  "skippedLargeFiles": []
+}
