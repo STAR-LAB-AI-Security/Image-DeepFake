@@ -1,0 +1,16 @@
+{
+  "workDirId": "mv6m6rr7xafj4j",
+  "scenario": "deepfake_image",
+  "role": "solo_defense",
+  "version": 4,
+  "uploadedAt": "2026-10-13T11:45:54.515Z",
+  "files": [
+    "attack.py",
+    "dataset.py",
+    "defense-blank.py",
+    "requirements.txt",
+    "solution.py",
+    "defense.zip",
+    "meta.json"
+  ]
+}
