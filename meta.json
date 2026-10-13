@@ -1,0 +1,22 @@
+{
+  "workDirId": "mv6h6vkszhtc98",
+  "branch": "atk-Xbean",
+  "uploaderBranch": true,
+  "githubAccount": "Xbean-git",
+  "displayName": "李哲文",
+  "scenario": "deepfake_image",
+  "role": "solo_attack",
+  "userId": "94bccdf4-4e07-4045-8fa6-e49a13974c64",
+  "version": 1,
+  "originalZipName": "shared_field_060_v2.zip",
+  "archivedZip": true,
+  "uploadedAt": "2026-10-13T09:25:37.337Z",
+  "files": [
+    "README.md",
+    "algorithm_manifest.json",
+    "attack-blank.py",
+    "requirements.txt",
+    "shared_field_060_v2.zip"
+  ],
+  "skippedLargeFiles": []
+}
