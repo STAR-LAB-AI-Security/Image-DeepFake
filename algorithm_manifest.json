@@ -1,0 +1,22 @@
+{
+  "parameters": {
+    "grid": 5,
+    "rho": 1.0,
+    "detail": 0.6,
+    "amplitude": 4.0,
+    "mode": "RF"
+  },
+  "seed": 42,
+  "official_interface": "JPEGReencodeAttack(quality=85, seed=42).apply(image)",
+  "source_sha256": {
+    "code_attack/adaptive_attack.py": "3d5475407620593a2192bb46c2fb9f88f83748e8a09c0595120f0ff0d342d00a",
+    "code_attack/multiscale_attack.py": "9254121a1f6d08366e7c149c19b408d1f134a84d51527a6727266ab16ef03ad0",
+    "code_attack/radial_attack.py": "f135434bf9898d0b70ca8a3dbcc86174ebbc32ed03f846f86811fce8414d52f2",
+    "code_attack/radial_field_ablation.py": "6b5ab6fbc0ff7746bac2930b3724e2d2ef9d90db2736fb9224395e62b1ee8cee"
+  },
+  "attack_blank_sha256": "f116db7fd2e49987c37d788edea906e981bdd4b436d2f28eb14a6d3602ec7b05",
+  "reference_config_sha256": "18018133d7cb5658d9f84d9c5f9efa90d81cc7e3760e0ba119ee3e6036b92a31",
+  "no_credentials": true,
+  "no_datasets": true,
+  "no_defense_code": true
+}
