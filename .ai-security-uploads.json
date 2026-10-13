@@ -1,0 +1,15 @@
+{
+  "workDirId": "mv6h6vkszhtc98",
+  "scenario": "deepfake_image",
+  "role": "solo_attack",
+  "version": 1,
+  "uploadedAt": "2026-10-13T09:25:46.331Z",
+  "files": [
+    "README.md",
+    "algorithm_manifest.json",
+    "attack-blank.py",
+    "requirements.txt",
+    "shared_field_060_v2.zip",
+    "meta.json"
+  ]
+}
